@@ -5,7 +5,8 @@ AB实验打标+分维度分析脚本（第二阶段）
 前置：需先运行 ab_analysis.py 获得第一阶段结果。
 输出: 同目录下生成 AB分析结果_标签维度_<filename>.xlsx
 """
-import argparse, os, time, json
+import argparse, os, time, json, hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import numpy as np
 from scipy import stats
@@ -13,8 +14,9 @@ import requests
 
 API_URL = "https://oneapi-comate.baidu-int.com/v1/chat/completions"
 API_KEY = "sk-qeNvUukW0VTSMp600eC1De92D2154c05AcAe8aD48a45CaC4"
-MODEL = "deepseek-v4-flash"
+MODELS = ["deepseek-v4-flash", "glm-4-flash"]
 BATCH_SIZE = 30
+CONCURRENCY = 4  # 并发请求数
 
 CATEGORIES = "整体评价类、性价比类、值得买类、用养成本类、口碑类、价格类、场景适配类、保值类、空间类、完整配置类、续航/充电类、驾驶与操控类、智能配置类、舒适配置类、安全配置类、外观类、车系推荐类、其他"
 
@@ -51,8 +53,10 @@ def is_read(s):
     return s.notna() & (s != '') & (s != '""')
 
 
-def classify_batch(queries):
+def classify_batch(queries, model=None):
     """调用LLM对一批query打标"""
+    if model is None:
+        model = MODELS[0]
     content = "\n".join([f"{i+1}. {q}" for i, q in enumerate(queries)])
     user_msg = f"对以下{len(queries)}条query逐条分类，每条输出一行JSON，共{len(queries)}行：\n{content}"
     headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
@@ -60,7 +64,7 @@ def classify_batch(queries):
     for _ in range(3):
         try:
             resp = requests.post(API_URL, headers=headers, json={
-                "model": MODEL,
+                "model": model,
                 "messages": [{"role": "system", "content": SYSTEM_PROMPT},
                              {"role": "user", "content": user_msg}],
                 "max_tokens": len(queries) * 80, "temperature": 0
@@ -88,8 +92,28 @@ def classify_batch(queries):
     return [None] * len(queries)
 
 
-def label_dataframe(df):
-    """对df中timediff!=0的query进行打标，返回带标签的df"""
+def _checkpoint_path(file_path, suffix):
+    """生成checkpoint文件路径"""
+    h = hashlib.md5(os.path.abspath(file_path).encode()).hexdigest()[:8]
+    return os.path.join(os.path.dirname(os.path.abspath(file_path)), f".label_ckpt_{h}_{suffix}.json")
+
+
+def _load_checkpoint(ckpt_path):
+    """加载checkpoint"""
+    if os.path.exists(ckpt_path):
+        with open(ckpt_path, 'r') as f:
+            return json.load(f)
+    return None
+
+
+def _save_checkpoint(ckpt_path, data):
+    """保存checkpoint"""
+    with open(ckpt_path, 'w') as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def label_dataframe(df, ckpt_suffix='default', file_path=''):
+    """对df中timediff!=0的query进行打标，支持断点续传和并发多模型"""
     mask = df['time_diff'] != 0
     queries = df.loc[mask, 'query'].fillna('').tolist()
     total = len(queries)
@@ -99,33 +123,76 @@ def label_dataframe(df):
         return df
 
     total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
-    print(f"  打标中: {total} queries, {total_batches} batches (size={BATCH_SIZE})")
+    ckpt_path = _checkpoint_path(file_path, ckpt_suffix) if file_path else ''
+
+    # 尝试恢复checkpoint
     all_types = [None] * total
     all_cats = [None] * total
-    t0 = time.time()
-    success = 0
+    start_batch = 0
+    if ckpt_path:
+        ckpt = _load_checkpoint(ckpt_path)
+        if ckpt and ckpt.get('total') == total:
+            all_types = ckpt['types']
+            all_cats = ckpt['cats']
+            start_batch = ckpt['done_batches']
+            print(f"  恢复checkpoint: 已完成 {start_batch}/{total_batches} batches")
 
-    for i in range(0, total, BATCH_SIZE):
-        batch = queries[i:i+BATCH_SIZE]
-        results = classify_batch(batch)
-        for j, r in enumerate(results):
-            if r and isinstance(r, dict):
-                all_types[i+j] = r.get('type', '')
-                all_cats[i+j] = r.get('category', '')
-                success += 1
-        done = min(i + BATCH_SIZE, total)
-        batch_no = i // BATCH_SIZE + 1
-        if batch_no % 5 == 0 or batch_no == total_batches:
-            elapsed = time.time() - t0
-            speed = done / elapsed if elapsed > 0 else 0
-            eta = (total - done) / speed if speed > 0 else 0
-            print(f"    [{batch_no}/{total_batches}] {done}/{total} ({100*done//total}%) | "
-                  f"耗时{elapsed:.0f}s | 预计剩余{eta:.0f}s | 成功率{100*success//done}%")
-        time.sleep(0.3)
+    if start_batch >= total_batches:
+        df.loc[mask, 'query类型'] = all_types
+        df.loc[mask, '汽车分类'] = all_cats
+        print(f"  打标已完成（从checkpoint恢复）")
+        return df
+
+    print(f"  打标中: {total} queries, {total_batches} batches, 并发={CONCURRENCY}, 模型={MODELS}")
+    t0 = time.time()
+    success = sum(1 for t in all_types if t)
+
+    # 并发打标：每CONCURRENCY个batch同时发出，轮流分配模型
+    batch_indices = list(range(start_batch * BATCH_SIZE, total, BATCH_SIZE))
+    i = 0
+    while i < len(batch_indices):
+        chunk = batch_indices[i:i+CONCURRENCY]
+        futures = {}
+        with ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
+            for ci, offset in enumerate(chunk):
+                batch = queries[offset:offset+BATCH_SIZE]
+                model = MODELS[ci % len(MODELS)]
+                futures[executor.submit(classify_batch, batch, model)] = offset
+            for future in as_completed(futures):
+                offset = futures[future]
+                results = future.result()
+                for j, r in enumerate(results):
+                    if r and isinstance(r, dict):
+                        all_types[offset+j] = r.get('type', '')
+                        all_cats[offset+j] = r.get('category', '')
+                        success += 1
+
+        i += CONCURRENCY
+        done_batches = start_batch + i
+        done_queries = min(done_batches * BATCH_SIZE, total)
+
+        # 保存checkpoint
+        if ckpt_path:
+            _save_checkpoint(ckpt_path, {
+                'total': total, 'done_batches': start_batch + i,
+                'types': all_types, 'cats': all_cats
+            })
+
+        # 进度报告
+        elapsed = time.time() - t0
+        speed = (i * BATCH_SIZE) / elapsed if elapsed > 0 else 0
+        remaining = total - done_queries
+        eta = remaining / speed if speed > 0 else 0
+        print(f"    [{start_batch+i}/{total_batches}] {done_queries}/{total} ({100*done_queries//total}%) | "
+              f"耗时{elapsed:.0f}s | 剩余{eta:.0f}s | 成功率{100*success//max(done_queries,1)}%")
 
     df.loc[mask, 'query类型'] = all_types
     df.loc[mask, '汽车分类'] = all_cats
-    print(f"  打标完成，成功率: {sum(1 for t in all_types if t)*100//total}%")
+    print(f"  打标完成，成功率: {success*100//total}%")
+
+    # 清理checkpoint
+    if ckpt_path and os.path.exists(ckpt_path):
+        os.remove(ckpt_path)
     return df
 
 
@@ -212,9 +279,9 @@ def main():
 
     # 打标
     print("\n[阶段1] 在线数据打标")
-    df_online = label_dataframe(df_online)
+    df_online = label_dataframe(df_online, ckpt_suffix='online', file_path=file_path)
     print("\n[阶段2] 离线数据打标")
-    df_offline = label_dataframe(df_offline)
+    df_offline = label_dataframe(df_offline, ckpt_suffix='offline', file_path=file_path)
 
     # 分维度分析（仅timediff!=0的数据）
     td_online = df_online[df_online['time_diff'] != 0]

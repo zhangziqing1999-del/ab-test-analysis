@@ -55,18 +55,32 @@ python3 <skill-path>/scripts/ab_analysis.py \
 
 ```bash
 python3 <skill-path>/scripts/ab_label_analysis.py \
-  --file "数据文件.xlsx" \
+  --file "数据文件.csv" \
   --groups "对照sid,实验1sid,实验2sid,..." \
-  --labels "对照label,实验1label,实验2label,..."
+  --labels "对照label,实验1label,实验2label,..." \
+  --exp-id 225457
 ```
 
-第二阶段会：
-1. 对timediff非0的query调用DSV4Flash进行LLM打标（query类型：客观/主观，汽车视角分类）
-2. 按"query类型"和"汽车分类"分别拆组做AB分析（交互率、完读率、深度）
-3. 输出 `AB分析结果_标签维度_<文件名>.xlsx`，包含：
-   - `按类型_在线` / `按类型_离线`: 按客观/主观拆组分析
-   - `按汽车分类_在线` / `按汽车分类_离线`: 按18个汽车子分类拆组分析
-   - `标注明细_在线` / `标注明细_离线`: 打标结果明细
+- `--file` 支持原始CSV（含 `ab实验sid` 列）或已生成的 `入口分组_*.xlsx` 中间文件
+- `--exp-id` 为CSV时必填，用于从复合 `ab实验sid`（如 `225457_2-230583_3`）中提取实验组
+
+第二阶段为5个阶段，每阶段产出/更新Excel，中断可断点续传：
+
+1. **阶段1 预处理**：提取实验组、按入口分组（保留全量数据，含time_diff=0），标记 `待打标=time_diff!=0`，输出中间文件 `入口分组_<文件名>.xlsx`（sheet `在线`/`离线`）
+2. **阶段2 基础AB分析**：基于全量数据做无标签AB分析（在线：一轮→二轮转化率/一轮完读率/二轮完读率；离线：二轮→三轮转化率/二轮完读率/三轮完读率）
+3. **阶段3 LLM打标**：对 `待打标=True` 的query用 deepseek-v4-flash + glm-5.1 并发打标（query类型：客观/主观，18类汽车分类）。**先对unique query去重打标再map回**（约省50%），checkpoint断点续传，每500条落盘
+4. **阶段4 标签维度AB分析**：标签取query自身（不传播）。在线锚定rank=1，离线锚定rank=2，按 `query类型` 和 `汽车分类` 拆组做AB分析
+5. **阶段5 最终输出**：汇总所有sheet到 `AB分析结果_标签维度_<文件名>.xlsx`，清理checkpoint
+
+输出Excel包含sheets：
+- `AB分析_在线` / `AB分析_离线`: 无标签整体AB分析
+- `按query类型_在线` / `按query类型_离线`: 按客观/主观拆组
+- `按汽车分类_在线` / `按汽车分类_离线`: 按18个汽车子分类拆组
+- `标注明细_在线` / `标注明细_离线`: 打标结果明细
+
+**效率优化**：query去重（约省52%）+ 并发8 + batch50 + 多模型轮询，约提速5-6倍。
+
+**容错**：checkpoint 仅在全流程结束后清理；打标过程每500条更新Excel快照，中途被kill不丢数据，重跑自动从checkpoint恢复。
 
 ### Step 4: 解读结果
 
@@ -87,15 +101,16 @@ python3 <skill-path>/scripts/ab_label_analysis.py \
 
 ## 分析指标说明
 
-**在线入口(series/pin_dao/dongtai):**
-- 二轮交互率 = rank2 query数 / rank1 query数
+**在线入口(series/pin_dao/dongtai)，锚定 rank=1:**
+- 一轮→二轮转化率 = rank2 query数 / rank1 query数
 - 一轮完读率 = rank1中recommend_prompt非空数 / rank1总数
 - 二轮完读率 = rank2中recommend_prompt非空数 / rank2总数
 
-**离线入口(其他所有request_type):**
-- 二轮交互率、二→三轮交互率
-- 二轮完读率、三轮完读率
+**离线入口(其他所有request_type)，锚定 rank=2:**
+- 二轮→三轮转化率 = rank3 query数 / rank2 query数
+- 二轮完读率 = rank2中完读数 / rank2总数
+- 三轮完读率 = rank3中完读数 / rank3总数
 
-**交互深度:**
-- 在线：人均交互轮次 = 总query / 唯一session数
-- 离线：有二轮用户的人均交互轮次
+> 离线从rank=2起算：离线入口首轮(rank=1)绝大多数 time_diff=0（曝光未真正交互），无有效打标，故从二轮看才有意义。
+
+**关键口径**：打标只针对 time_diff!=0 的query，但AB指标的分母必须用**全量数据**（含time_diff=0）；否则离线rank=1样本骤减，转化率会算出>1的异常值。

@@ -14,7 +14,7 @@ import requests
 
 API_URL = "https://oneapi-comate.baidu-int.com/v1/chat/completions"
 API_KEY = "sk-qeNvUukW0VTSMp600eC1De92D2154c05AcAe8aD48a45CaC4"
-MODELS = ["deepseek-v4-flash", "glm-4-flash"]
+MODELS = ["deepseek-v4-flash", "glm-5.1"]
 BATCH_SIZE = 30
 CONCURRENCY = 4  # 并发请求数
 

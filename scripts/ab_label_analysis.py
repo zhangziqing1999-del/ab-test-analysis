@@ -98,9 +98,12 @@ def label_dataframe(df):
         df['汽车分类'] = None
         return df
 
-    print(f"  打标中: {total} queries, batch={BATCH_SIZE}")
+    total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+    print(f"  打标中: {total} queries, {total_batches} batches (size={BATCH_SIZE})")
     all_types = [None] * total
     all_cats = [None] * total
+    t0 = time.time()
+    success = 0
 
     for i in range(0, total, BATCH_SIZE):
         batch = queries[i:i+BATCH_SIZE]
@@ -109,8 +112,15 @@ def label_dataframe(df):
             if r and isinstance(r, dict):
                 all_types[i+j] = r.get('type', '')
                 all_cats[i+j] = r.get('category', '')
-        if (i // BATCH_SIZE + 1) % 20 == 0:
-            print(f"    进度: {min(i+BATCH_SIZE, total)}/{total}")
+                success += 1
+        done = min(i + BATCH_SIZE, total)
+        batch_no = i // BATCH_SIZE + 1
+        if batch_no % 5 == 0 or batch_no == total_batches:
+            elapsed = time.time() - t0
+            speed = done / elapsed if elapsed > 0 else 0
+            eta = (total - done) / speed if speed > 0 else 0
+            print(f"    [{batch_no}/{total_batches}] {done}/{total} ({100*done//total}%) | "
+                  f"耗时{elapsed:.0f}s | 预计剩余{eta:.0f}s | 成功率{100*success//done}%")
         time.sleep(0.3)
 
     df.loc[mask, 'query类型'] = all_types
